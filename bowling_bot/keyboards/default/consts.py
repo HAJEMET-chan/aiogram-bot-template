@@ -10,8 +10,8 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-from aiogram_bot_template import exceptions
-from aiogram_bot_template.keyboards.keyboard_utils import schema_generator
+from bowling_bot import exceptions
+from bowling_bot.keyboards.keyboard_utils import schema_generator
 
 POSSIBLE_BUTTON_PROPERTIES_VALUES = (  # https://core.telegram.org/bots/api#keyboardbutton
     str
