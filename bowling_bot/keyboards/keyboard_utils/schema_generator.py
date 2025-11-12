@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from typing import TypeVar
 
-from bowling_bot import exceptions
+from ... import exceptions
 
 T = TypeVar("T")
 

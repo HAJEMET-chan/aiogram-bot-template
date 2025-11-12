@@ -3,8 +3,8 @@ import sys
 
 import structlog
 
-from bowling_bot import models
-from bowling_bot.data import config
+from .. import models
+from ..data import config
 
 
 def setup_logger() -> structlog.typing.FilteringBoundLogger:

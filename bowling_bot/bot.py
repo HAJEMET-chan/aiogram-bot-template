@@ -12,9 +12,9 @@ from aiogram.fsm.storage.redis import DefaultKeyBuilder, RedisStorage
 from aiohttp import web
 from redis.asyncio import Redis
 
-from bowling_bot import handlers, utils, web_handlers
-from bowling_bot.data import config
-from bowling_bot.middlewares import StructLoggingMiddleware
+from . import handlers, utils, web_handlers
+from .data import config
+from .middlewares import StructLoggingMiddleware
 
 if TYPE_CHECKING:
     import asyncpg

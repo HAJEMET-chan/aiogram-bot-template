@@ -1,8 +1,8 @@
 from aiogram import Router
 from aiogram.filters import CommandStart, StateFilter
 
-from bowling_bot import states
-from bowling_bot.filters import ChatTypeFilter, TextFilter
+from ... import states
+from ...filters import ChatTypeFilter, TextFilter
 
 from . import start
 

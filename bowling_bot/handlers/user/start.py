@@ -1,7 +1,7 @@
 from aiogram import html, types
 from aiogram.fsm.context import FSMContext
 
-from bowling_bot import states
+from ... import states
 
 
 async def start(msg: types.Message, state: FSMContext) -> None:
