@@ -5,6 +5,8 @@
 1. [Быстрый старт](#быстрый-старт)
 2. [Примеры обработчиков](#примеры-обработчиков)
 3. [Работа с БД](#работа-с-бд)
+    1. [Модели данных (Pydantic)](#модели-данных-pydantic)
+    2. [Улучшенная работа с репозиториями и моделями](#улучшенная-работа-с-репозиториями-и-моделями)
 4. [FSM и диалоги](#fsm-и-диалоги)
 5. [Клавиатуры](#клавиатуры)
 6. [Обработка ошибок](#обработка-ошибок)
@@ -62,7 +64,10 @@ CREATE TABLE users (
     username VARCHAR(255),
     full_name VARCHAR(255),
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    is_bot BOOLEAN DEFAULT FALSE,
+    is_premium BOOLEAN DEFAULT FALSE,
+    language_code VARCHAR(10) DEFAULT 'ru'
 );
 
 -- Индекс для быстрого поиска
@@ -356,133 +361,342 @@ async def transfer_points(
             )
 ```
 
+### Модели данных (Pydantic)
+
+Для удобной работы с данными из базы данных в шаблоне используются Pydantic модели. Они позволяют валидировать данные и предоставляют удобный доступ к полям с автодополнением в IDE.
+
+#### 1. Создание модели
+
+Создайте файл `bowling_bot/models/user_model.py`:
+
+```python
+# bowling_bot/models/user_model.py
+from datetime import datetime
+from .base import BaseModel
+
+class User(BaseModel):
+    id: int
+    telegram_id: int
+    username: str | None
+    full_name: str
+    created_at: datetime
+    updated_at: datetime
+    is_bot: bool
+    is_premium: bool | None
+    language_code: str | None
+```
+
+#### 2. Использование модели
+
+После получения данных из БД, вы можете легко конвертировать их в Pydantic модель.
+
+```python
+# Получение одного результата
+result = await db_conn._fetchrow(
+    "SELECT * FROM users WHERE telegram_id = $1",
+    (user_id,),
+)
+if result.data:
+    user: User = result.convert(User)
+    print(user.full_name)
+
+# Получение нескольких результатов
+results = await db_conn._fetch(
+    "SELECT * FROM users WHERE is_premium = $1",
+    (True,),
+)
+if results.data:
+    users: list[User] = results.convert(User)
+    for user in users:
+        print(user.username)
+```
+
+Это делает код более чистым, безопасным и читаемым.
+
+### Улучшенная работа с репозиториями и моделями
+
+Давайте объединим репозитории и модели для создания более надежного и удобного слоя доступа к данным.
+
+#### 1. Обновление репозитория
+
+Изменим методы репозитория так, чтобы они возвращали Pydantic модели вместо словарей (`dict`).
+
+```python
+# db/repositories/user_repository.py
+from typing import TYPE_CHECKING
+from bowling_bot.models.user_model import User
+
+if TYPE_CHECKING:
+    from bowling_bot.db.db_api.storages.postgres import PostgresConnection
+
+class UserRepository:
+    def __init__(self, db_conn: "PostgresConnection") -> None:
+        self.db_conn = db_conn
+
+    async def get_by_telegram_id(self, telegram_id: int) -> User | None:
+        """Получить пользователя по Telegram ID"""
+        result = await self.db_conn._fetchrow(
+            "SELECT * FROM users WHERE telegram_id = $1",
+            (telegram_id,),
+        )
+        if result.data:
+            return result.convert(User)
+        return None
+
+    async def create(
+        self,
+        telegram_id: int,
+        username: str | None,
+        full_name: str,
+        is_premium: bool | None,
+        language_code: str | None,
+    ) -> User:
+        """Создать или обновить пользователя и вернуть модель."""
+        result = await self.db_conn._fetchrow(
+            """
+            INSERT INTO users (telegram_id, username, full_name, is_premium, language_code, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+            ON CONFLICT (telegram_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name,
+                is_premium = EXCLUDED.is_premium,
+                language_code = EXCLUDED.language_code,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            (telegram_id, username, full_name, is_premium, language_code),
+        )
+        # После INSERT ... RETURNING * fetchrow вернет данные
+        return result.convert(User)
+```
+
+#### 2. Использование в обработчике
+
+Теперь обработчик выглядит еще чище и работает с типизированными объектами.
+
+```python
+# handlers/user/start.py
+from aiogram import types
+from aiogram.fsm.context import FSMContext
+from typing import TYPE_CHECKING
+from bowling_bot.db.repositories.user_repository import UserRepository
+
+if TYPE_CHECKING:
+    from bowling_bot.db.db_api.storages.postgres import PostgresConnection
+
+async def start(
+    msg: types.Message,
+    state: FSMContext,
+    db_conn: "PostgresConnection",
+) -> None:
+    """Обработчик команды /start с использованием репозитория и модели"""
+    if msg.from_user is None:
+        return
+
+    user_repo = UserRepository(db_conn)
+    user = await user_repo.create(
+        telegram_id=msg.from_user.id,
+        username=msg.from_user.username,
+        full_name=msg.from_user.full_name,
+        is_premium=msg.from_user.is_premium,
+        language_code=msg.from_user.language_code,
+    )
+
+    await msg.answer(f"Добро пожаловать, {user.full_name}!")
+    await msg.answer(f"Ваш ID в базе: {user.id}")
+```
+
+**Преимущества такого подхода:**
+- **Типобезопасность**: IDE и `mypy` будут подсказывать вам поля и ловить ошибки.
+- **Читаемость**: Код становится более декларативным и понятным.
+- **Надежность**: Pydantic автоматически валидирует данные, полученные из БД.
+- **Разделение ответственности**: Обработчик не знает о структуре БД, он просто вызывает метод репозитория.
+
+
 ## FSM и диалоги
 
-### Многошаговый диалог
+FSM (Finite State Machine, или Конечный автомат) — это мощный инструмент в `aiogram` для создания многошаговых диалогов с пользователем. Он позволяет боту "запоминать", на каком этапе общения находится пользователь, и соответственно реагировать на его сообщения.
+
+Это идеально подходит для:
+-   Сбора данных (регистрация, анкеты, оформление заказа).
+-   Создания викторин и тестов.
+-   Пошаговых инструкций.
+
+В этом шаблоне состояния хранятся в **Redis**, что обеспечивает их сохранность между перезапусками бота.
+
+### Основные концепции
+
+1.  **Состояние (State)**: Конкретный шаг в диалоге. Например, "ожидание имени пользователя" или "ожидание подтверждения".
+2.  **Группа состояний (StatesGroup)**: Логическое объединение нескольких состояний. Например, все состояния, связанные с процессом регистрации, объединены в группу `RegistrationStates`.
+3.  **Контекст (FSMContext)**: Объект, который хранит текущее состояние пользователя и временные данные, которые вы собираете в процессе диалога (например, введенное имя или возраст). Этот объект доступен в каждом обработчике, если его указать в аргументах.
+
+### Пошаговый пример: Диалог регистрации
+
+Давайте разберем на примере существующего в шаблоне диалога регистрации (`handlers/user/registration.py`).
+
+#### 1. Определение состояний
+
+Сначала нужно определить все шаги нашего диалога. В шаблоне это уже сделано в файле `states/user.py`.
 
 ```python
 # states/user.py
 from aiogram.fsm.state import State, StatesGroup
 
+# Состояния для главного меню
+class UserMainMenu(StatesGroup):
+    menu = State()
+
+# Состояния для процесса регистрации
 class RegistrationStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_age = State()
     waiting_for_confirmation = State()
 ```
 
+Здесь мы видим группу `RegistrationStates`, которая описывает три последовательных шага.
+
+#### 2. Создание обработчиков для каждого шага
+
+Для каждого состояния нужен свой обработчик, который будет "ловить" ответ пользователя именно на этом шаге.
+
+##### **Шаг 1: Начало диалога**
+
+Этот обработчик запускает процесс регистрации.
+
 ```python
 # handlers/user/registration.py
-from aiogram import types
-from aiogram.fsm.context import FSMContext
-from bowling_bot import states
-from bowling_bot.keyboards.default import BasicButtons
+
+# ... импорты ...
 
 async def start_registration(msg: types.Message, state: FSMContext) -> None:
     """Начать регистрацию"""
+    # Устанавливаем первое состояние: ожидание имени
     await state.set_state(states.user.RegistrationStates.waiting_for_name)
     await msg.answer(
         "Давайте зарегистрируем вас!\nВведите ваше имя:",
-        reply_markup=BasicButtons.cancel(),
+        reply_markup=BasicButtons.cancel(), # Добавляем кнопку отмены
     )
+```
+-   `state.set_state(...)` переводит пользователя в указанное состояние.
+-   Теперь `aiogram` будет перенаправлять сообщения от этого пользователя только тем обработчикам, которые помечены фильтром для этого состояния.
+
+
+##### **Шаг 2: Обработка имени и переход к следующему шагу**
+
+Этот обработчик сработает, только если пользователь находится в состоянии `waiting_for_name`.
+
+```python
+# handlers/user/registration.py
 
 async def process_name(msg: types.Message, state: FSMContext) -> None:
     """Обработать имя"""
-    if msg.text is None:
+    if not msg.text: # Простая валидация
         await msg.answer("Пожалуйста, отправьте текстовое сообщение.")
         return
     
+    # Сохраняем введенное имя во временное хранилище FSM
     await state.update_data(name=msg.text)
-    await state.set_state(states.user.RegistrationStates.waiting_for_age)
+    
     await msg.answer("Отлично! Теперь введите ваш возраст:")
+    # Переключаем на следующее состояние: ожидание возраста
+    await state.set_state(states.user.RegistrationStates.waiting_for_age)
+```
+-   `state.update_data(name=...)` сохраняет данные в хранилище FSM. Эти данные будут доступны на всех последующих шагах.
+-   `state.set_state(...)` переводит пользователя на следующий шаг.
+
+##### **Шаг 3: Обработка возраста и запрос подтверждения**
+
+Аналогично предыдущему шагу, но с дополнительной валидацией возраста.
+
+```python
+# handlers/user/registration.py
 
 async def process_age(msg: types.Message, state: FSMContext) -> None:
-    """Обработать возраст"""
-    if msg.text is None:
-        await msg.answer("Пожалуйста, отправьте текстовое сообщение.")
-        return
+    # ... (код валидации возраста) ...
     
-    try:
-        age = int(msg.text)
-        if age < 0 or age > 150:
-            raise ValueError
-    except ValueError:
-        await msg.answer("Пожалуйста, введите корректный возраст (число от 0 до 150).")
-        return
+    await state.update_data(age=int(msg.text))
     
-    await state.update_data(age=age)
+    # Получаем все сохраненные данные
     data = await state.get_data()
     
+    # Устанавливаем состояние подтверждения
     await state.set_state(states.user.RegistrationStates.waiting_for_confirmation)
     await msg.answer(
-        f"Проверьте данные:\n"
-        f"Имя: {data['name']}\n"
-        f"Возраст: {data['age']}",
+        f"Проверьте данные:\nИмя: {data['name']}\nВозраст: {data['age']}",
         reply_markup=BasicButtons.confirmation(add_cancel=True),
     )
+```
+-   `state.get_data()` извлекает все данные, сохраненные ранее (`{'name': 'Иван', 'age': 25}`).
+
+##### **Шаг 4: Завершение диалога**
+
+После подтверждения данных диалог нужно завершить.
+
+```python
+# handlers/user/registration.py
 
 async def confirm_registration(msg: types.Message, state: FSMContext) -> None:
-    """Подтвердить регистрацию"""
-    data = await state.get_data()
+    # ... (сохранение данных в БД) ...
     
-    # Сохранение в БД
-    # ... ваш код ...
-    
+    # Полностью очищаем состояние и данные
     await state.clear()
+    
     await msg.answer(
         "Регистрация завершена!",
         reply_markup=types.ReplyKeyboardRemove(),
     )
-
-async def cancel_registration(msg: types.Message, state: FSMContext) -> None:
-    """Отменить регистрацию"""
-    await state.clear()
-    await msg.answer(
-        "Регистрация отменена.",
-        reply_markup=types.ReplyKeyboardRemove(),
-    )
 ```
+-   `state.clear()` — **обязательный шаг для завершения диалога**. Он сбрасывает состояние пользователя и удаляет все временные данные.
 
-Регистрация:
+#### 3. Регистрация обработчиков с фильтрами
+
+Чтобы `aiogram` знал, какой обработчик для какого состояния использовать, применяются `StateFilter`.
 
 ```python
 # handlers/user/__init__.py
-from aiogram import Router
 from aiogram.filters import StateFilter
-from bowling_bot import states
-from bowling_bot.filters import ChatTypeFilter, TextFilter
-from . import registration
 
-def prepare_router() -> Router:
-    user_router = Router()
-    user_router.message.filter(ChatTypeFilter("private"))
-    
-    # Начало регистрации
-    user_router.message.register(
-        registration.start_registration,
-        TextFilter("📝 Регистрация"),
-    )
-    
-    # Шаги регистрации
-    user_router.message.register(
-        registration.process_name,
-        StateFilter(states.user.RegistrationStates.waiting_for_name),
-    )
-    user_router.message.register(
-        registration.process_age,
-        StateFilter(states.user.RegistrationStates.waiting_for_age),
-    )
-    user_router.message.register(
-        registration.confirm_registration,
-        TextFilter("✅Подтвердить"),
-        StateFilter(states.user.RegistrationStates.waiting_for_confirmation),
-    )
-    user_router.message.register(
-        registration.cancel_registration,
-        TextFilter("🚫 Отмена"),
-    )
-    
-    return user_router
+# ...
+
+# Начало регистрации (сработает, если нет активного состояния)
+user_router.message.register(
+    registration.start_registration,
+    TextFilter("📝 Регистрация"),
+    StateFilter(None) # или StateFilter(states.user.UserMainMenu.menu)
+)
+
+# Шаги регистрации
+user_router.message.register(
+    registration.process_name,
+    StateFilter(states.user.RegistrationStates.waiting_for_name),
+)
+user_router.message.register(
+    registration.process_age,
+    StateFilter(states.user.RegistrationStates.waiting_for_age),
+)
+
+# Подтверждение и отмена
+user_router.message.register(
+    registration.confirm_registration,
+    TextFilter("✅Подтвердить"),
+    StateFilter(states.user.RegistrationStates.waiting_for_confirmation),
+)
+
+# Обработчик отмены может работать в любом состоянии
+user_router.message.register(
+    registration.cancel_registration,
+    TextFilter("🚫 Отмена"),
+    StateFilter("*") # "*" означает "любое состояние"
+)
 ```
+
+### Управление состоянием и данными (`FSMContext`)
+
+-   `await state.set_state(StateName)`: Устанавливает пользователю новое состояние.
+-   `await state.get_state()`: Возвращает текущее состояние пользователя (в виде строки, например, `"RegistrationStates:waiting_for_name"`).
+-   `await state.update_data(key=value, ...)`: Сохраняет временные данные. Данные привязаны к пользователю и чату.
+-   `await state.get_data()`: Возвращает словарь со всеми сохраненными данными для текущего пользователя.
+-   `await state.clear()`: **Полностью сбрасывает** состояние и удаляет все временные данные пользователя. Этой командой нужно завершать любой диалог.
 
 ## Клавиатуры
 
